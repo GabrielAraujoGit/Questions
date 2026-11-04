@@ -1,6 +1,6 @@
 # Respostas: Avaliação Técnica
 
-Respostas às três perguntas sobre chatbot de WhatsApp, entrega de features em produção e ouvidoria anônima de RH. A stack dos exemplos é Python.
+Respostas às três perguntas sobre chatbot de WhatsApp, entrega de features em produção e ouvidoria anônima de RH. As tecnologias citadas são exemplos; eu escolheria a stack final conforme o contexto, a equipe e os requisitos do produto.
 
 ## Sumário
 
@@ -14,109 +14,39 @@ Respostas às três perguntas sobre chatbot de WhatsApp, entrega de features em 
 
 ### Resposta resumida
 
-Eu usaria a **WhatsApp Cloud API** com um webhook em **FastAPI** que só valida a assinatura, deduplica a mensagem e responde 200 rápido. O processamento acontece fora do request, em workers (**ARQ + Redis**), que carregam o histórico, buscam contexto na base de conhecimento (**RAG com pgvector**) e chamam o LLM com guardrails. Se a confiança for baixa ou o cliente pedir, a conversa vai para um atendente humano.
+Eu usaria a API oficial do WhatsApp Business Platform, evitando automações não oficiais que podem colocar o número em risco. O webhook validaria a assinatura e registraria cada evento de forma durável antes de responder rapidamente. Workers processariam as mensagens fora da requisição, com idempotência pelo identificador da mensagem e ordenação por conversa.
 
-Os principais pontos de atenção em produção são:
-- **Regras do canal:** janela de 24h e templates aprovados.
-- **Confiabilidade:** idempotência, ordem das mensagens e resiliência (retry, DLQ).
-- **Qualidade e segurança:** alucinação, prompt injection e LGPD.
-- **Operação:** custo, latência e observabilidade, com avaliação contínua das conversas.
+No processamento, carregaria apenas o histórico necessário, buscaria contexto em uma base de conhecimento com RAG e chamaria o modelo com instruções e limites claros. O bot responderia com base nas fontes recuperadas; quando não houvesse suporte suficiente, o assunto fosse sensível ou o cliente pedisse, encaminharia a conversa para uma pessoa.
 
 ### Stack e justificativa
 
-| Camada | Escolha | Por quê |
+| Camada | Opção de exemplo | Por quê |
 |---|---|---|
-| Canal | WhatsApp Cloud API (Meta) | API oficial, sem risco de bloqueio de número |
-| Webhook | FastAPI | Async nativo, validação com Pydantic |
-| Fila | ARQ + Redis | Responder 200 rápido e processar fora do request |
-| Estado | PostgreSQL + pgvector | Histórico e busca vetorial no mesmo banco |
-| IA | SDK do LLM + RAG | Respostas ancoradas na base de conhecimento |
+| Canal | WhatsApp Business Platform / Cloud API | Canal oficial; reduz riscos associados a automações não oficiais |
+| Webhook | FastAPI ou serviço equivalente | Validação do evento e resposta rápida |
+| Fila e workers | Redis com fila durável ou serviço gerenciado | Processamento assíncrono, retries e isolamento de falhas |
+| Estado | PostgreSQL | Histórico de conversa e estado operacional |
+| Busca e IA | RAG, banco vetorial e LLM | Respostas ancoradas na base de conhecimento, com fontes recuperáveis |
 
 ### Arquitetura
 
-```mermaid
-flowchart TD
-    C["Cliente (WhatsApp)"] --> M["WhatsApp Cloud API"]
-    M -->|webhook| W["FastAPI: valida assinatura"]
-    W -->|200 OK rápido| M
-    W -->|dedup por wamid| Q[("Fila ARQ + Redis")]
-    Q --> K["Worker: lock por conversa"]
-    K --> H[("Postgres: histórico")]
-    K --> R["RAG: busca vetorial (pgvector)"]
-    R --> L["LLM + guardrails"]
-    L --> D{"Confiança alta?"}
-    D -->|sim| S["Envia resposta pela API"]
-    D -->|não ou pediu humano| A["Handoff para atendente"]
-    S --> C
-    A --> C
-    K -.->|falhas repetidas| DLQ[("DLQ")]
-    K -.-> O["Logs, métricas e avaliação"]
-```
+Cliente no WhatsApp → API oficial → webhook que valida e persiste o evento → fila durável → worker por conversa → histórico e busca RAG → LLM com guardrails → resposta ou transferência para humano → envio pela API oficial.
 
 ### Webhook (validação, idempotência e fila)
 
-```python
-import hmac, hashlib
-from fastapi import FastAPI, Request, HTTPException, Header
-
-app = FastAPI()
-
-def assinatura_valida(body: bytes, header: str | None) -> bool:
-    if not header:
-        return False
-    esperado = "sha256=" + hmac.new(APP_SECRET.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(esperado, header)
-
-@app.post("/webhook")
-async def webhook(request: Request, x_hub_signature_256: str | None = Header(None)):
-    body = await request.body()
-    if not assinatura_valida(body, x_hub_signature_256):
-        raise HTTPException(status_code=403)
-
-    for msg in extrair_mensagens(await request.json()):
-        # idempotência: a Meta reenvia o webhook se demorar
-        if await redis.set(f"wamid:{msg['id']}", 1, nx=True, ex=86400):
-            await fila.enqueue_job("processar_mensagem", msg)
-    return {"status": "ok"}
-```
+Validaria a assinatura sobre o corpo original da requisição. Para evitar perda de mensagens, gravaria o evento com uma chave única, como o ID da mensagem, e uma tarefa de outbox na mesma transação; um publicador encaminharia a tarefa à fila. Só responderia sucesso depois da persistência durável. Assim, um retry do provedor não duplica o processamento, e uma falha momentânea da fila não faz o evento desaparecer.
 
 ### Worker (RAG, handoff e resposta)
 
-```python
-async def processar_mensagem(ctx, msg: dict):
-    telefone = msg["from"]
-    texto = msg["text"]["body"]
-
-    # lock por conversa garante a ordem das mensagens
-    async with ctx["redis"].lock(f"conv:{telefone}", timeout=60):
-        historico = await carregar_historico(telefone, limite=10)
-        trechos = await retriever.buscar(texto, k=4)
-
-        resposta = await llm.responder(
-            system=SYSTEM_PROMPT,
-            contexto=trechos,
-            historico=historico,
-            pergunta=texto,
-        )
-
-        if resposta.confianca < 0.6 or resposta.pede_humano:
-            return await transferir_para_humano(telefone, historico)
-
-        await whatsapp.enviar_texto(telefone, resposta.texto)
-        await salvar_turno(telefone, texto, resposta.texto)
-```
+O worker processaria mensagens em ordem por conversa, carregaria um trecho limitado do histórico, buscaria documentos relevantes e geraria uma resposta. Registraria o resultado e o estado antes ou junto do envio, com idempotência também na saída quando possível. Se faltassem fontes, houvesse baixa confiança validada por avaliações, uma solicitação explícita ou um tema sensível, encaminharia para atendimento humano em vez de improvisar.
 
 ### Pontos de atenção em produção
 
-- **Janela de 24h:** fora dela só é possível enviar template aprovado. O worker checa isso antes de enviar.
-- **Idempotência e ordem:** deduplicação pelo `wamid` e lock por conversa.
-- **Resiliência:** retry com backoff (tenacity), DLQ e circuit breaker no provedor de LLM.
-- **Alucinação:** responder só com base no contexto recuperado, citar a fonte e recusar quando não souber.
-- **Prompt injection:** conteúdo recuperado e mensagem do usuário entram como dados, nunca como instrução. As tools têm allowlist e escopo mínimo.
-- **LGPD:** consentimento, mascaramento de CPF e telefone nos logs, retenção definida e direito de exclusão.
-- **Custo e latência:** cache de respostas frequentes, modelo menor para intents simples e limite de tokens.
-- **Observabilidade:** OpenTelemetry e Sentry, com `correlation_id` por conversa.
-- **Qualidade contínua:** conjunto de conversas de referência rodando no CI, com métricas de acerto, taxa de handoff, CSAT e custo por conversa.
+- **Regras do canal:** acompanhar janela de atendimento, templates aprovados e limites de envio conforme a política vigente da Meta.
+- **Confiabilidade:** idempotência de entrada e saída, ordem por conversa, timeout, retry com backoff, fila de falhas e monitoramento dos provedores.
+- **Qualidade e segurança:** avaliar alucinações, prompt injection e uso de ferramentas; tratar mensagens e documentos como dados não confiáveis; manter revisão humana em casos de risco.
+- **Privacidade:** minimizar dados, definir retenção e exclusão, controlar acesso e mascarar informações pessoais nos logs, conforme a LGPD.
+- **Operação:** acompanhar latência, erros, custo por conversa, resolução, transferências para humanos e satisfação; manter alertas e um conjunto de conversas de referência para avaliação contínua.
 
 ---
 
@@ -124,57 +54,29 @@ async def processar_mensagem(ctx, msg: dict):
 
 ### Resposta resumida
 
-Eu trato a produção como o último ambiente de teste, não o primeiro. O caminho é:
-1. **Requisitos:** critérios de aceite claros antes de codar.
-2. **Testes:** unitários e de integração com serviços reais, rodando no CI junto com lint, tipagem e análise de segurança.
-3. **Staging:** ambiente parecido com produção e migrations testadas.
-4. **Deploy:** a feature sobe atrás de uma **feature flag** desligada, com rollout gradual (1%, 10%, 100%) e métricas e alertas prontos desde o início.
+Eu começaria definindo o problema, os critérios de aceite, os casos de borda e como medir o resultado esperado. Depois verificaria impactos em segurança, privacidade, desempenho, integrações e compatibilidade com dados e clientes existentes.
 
-Se algo degradar, o rollback é desligar a flag, sem novo deploy. Depois acompanho erro, latência e métrica de negócio nas primeiras horas.
+Implementaria testes unitários para regras de negócio, testes de integração para banco, filas e contratos externos, e testes ponta a ponta para os fluxos críticos. No CI, executaria testes, lint, análise de tipos e verificações de dependências e segurança, além de revisão de código. Em staging, validaria o fluxo em configuração próxima à produção, incluindo migrations e plano de rollback.
 
 ### Caminho até a produção
 
-```mermaid
-flowchart TD
-    A["Requisitos e critérios de aceite"] --> B["Código + testes"]
-    B --> C["PR: review + CI (ruff, mypy, pytest)"]
-    C --> D["Deploy em staging"]
-    D --> E["Migrations expand/contract + teste de carga"]
-    E --> F["Deploy em produção com flag OFF"]
-    F --> G["Rollout 1% → 10% → 100%"]
-    G --> H{"Métricas saudáveis?"}
-    H -->|sim| I["Flag em 100% + limpeza"]
-    H -->|não| J["Desliga a flag (rollback)"]
-    J --> B
-```
+Requisitos e critérios de aceite → implementação e testes → revisão e CI → staging → deploy gradual → acompanhamento de métricas → expansão do rollout ou rollback.
 
 ### Feature flag com rollout gradual
 
-```python
-import hashlib
-
-def flag_ativa(nome: str, usuario_id: str, percentual: int) -> bool:
-    # bucket estável: o mesmo usuário sempre cai no mesmo grupo
-    h = int(hashlib.sha256(f"{nome}:{usuario_id}".encode()).hexdigest(), 16)
-    return (h % 100) < percentual
-
-@router.post("/pedidos")
-async def criar_pedido(body: PedidoIn, user=Depends(usuario_atual)):
-    if flag_ativa("novo_fluxo_pedido", user.id, settings.ROLLOUT_NOVO_FLUXO):
-        return await novo_fluxo(body, user)
-    return await fluxo_antigo(body, user)
-```
+Quando fizer sentido, publicaria a implementação atrás de uma feature flag, inicialmente desligada. Liberaria para grupos pequenos e estáveis de usuários, ampliando gradualmente se os indicadores de erro, latência e negócio permanecerem saudáveis. A flag permite interromper a exposição rapidamente; ela não substitui rollback de código nem migrations compatíveis.
 
 ### Passos
 
-1. **Requisitos claros:** critérios de aceite e casos de borda definidos antes de codar.
-2. **Testes:** `pytest` (unitários), `hypothesis` nos casos de borda e testes de integração com `testcontainers` (Postgres e Redis reais, não mocks).
-3. **CI:** `ruff`, `mypy`, `bandit` e `pip-audit`. O merge só acontece com tudo verde, após code review.
-4. **Staging** com volume de dados parecido com o de produção e teste de carga (Locust) nos fluxos críticos.
-5. **Migrations seguras (Alembic):** padrão expand/contract. Primeiro adiciono a coluna, depois migro o código e só então removo a antiga. Assim o rollback do código nunca quebra o schema.
-6. **Feature flag:** a feature sobe desligada e o rollout é gradual. O rollback é desligar a flag, sem novo deploy.
-7. **Observabilidade antes do deploy:** métricas, alertas e dashboard da feature já criados, além de um runbook curto.
-8. **Pós-deploy:** acompanho taxa de erro, latência e métrica de negócio nas primeiras horas, comparando com o baseline. Se algo falhar, faço um post-mortem sem culpados.
+1. **Requisitos claros:** critérios de aceite, cenários de falha e casos de borda definidos antes de codar.
+2. **Testes:** unitários, integração e ponta a ponta proporcionais ao risco; uso de serviços isolados ou containers quando útil, sem depender apenas de mocks para contratos críticos.
+3. **CI e revisão:** testes, lint, tipos, análise de segurança e revisão antes do merge.
+4. **Staging:** ambiente semelhante à produção para validar fluxos, configurações, carga relevante e dependências.
+5. **Migrations seguras:** mudanças compatíveis com versões antigas e novas do código; usar expand/contract quando necessário para que um rollback da aplicação não quebre o schema.
+6. **Observabilidade:** métricas, logs, alertas, dashboard e procedimento de resposta preparados antes do deploy.
+7. **Rollout:** feature flag ou canary em etapas, com comparação ao baseline e critérios explícitos para avançar ou interromper.
+8. **Pós-deploy:** acompanhar erros, latência e métricas do produto; se houver regressão, desativar a flag ou reverter a versão e investigar a causa sem culpabilização.
+9. **Limpeza:** após estabilidade, remover flags temporárias e código antigo com segurança.
 
 ---
 
@@ -182,81 +84,27 @@ async def criar_pedido(body: PedidoIn, user=Depends(usuario_atual)):
 
 ### Resposta resumida
 
-O colaborador envia a denúncia por um formulário **sem login**. A API valida e filtra spam (rate limit e captcha) **sem registrar IP nem metadados**, gera um **protocolo** e um **token** aleatório e devolve os dois uma única vez. O conteúdo é salvo **criptografado** e só o **hash** do token fica no banco, então nem o RH consegue ligar o caso a uma pessoa.
+Eu separaria o envio do relato do acesso do RH. A pessoa enviaria um formulário sem login e sem campos de identificação obrigatórios. A API validaria e sanitizaria o conteúdo, aplicaria controles contra abuso e criaria um protocolo e um segredo aleatório de acompanhamento. O segredo seria mostrado uma única vez; no banco, guardaria apenas o hash. O relato seria criptografado em trânsito e em repouso, com as chaves fora do banco.
 
-O RH é notificado sem nenhum dado do autor e trabalha em um painel com SSO, controle de acesso por perfil e **auditoria** de quem abriu cada caso. Ele faz a triagem (com sugestão automática de categoria e gravidade, sempre revisada por uma pessoa), investiga e responde no protocolo. O colaborador acompanha e responde de forma anônima usando o token.
+O RH receberia uma notificação sem o token e sem dados desnecessários do relato. No painel, usaria SSO, permissões por função e trilha de auditoria. Uma classificação automática de assunto ou urgência poderia apoiar a triagem, sempre como sugestão revisada por uma pessoa. A pessoa consultaria atualizações e responderia usando o protocolo e o segredo, sem criar uma conta.
 
 ### Princípio
 
-O sistema nunca guarda o que identificaria o autor. O banco guarda apenas o **hash** do token, então nem o RH consegue ligar a denúncia a uma pessoa.
+O sistema não deve coletar identidade ou vínculo com a empresa para receber o relato. Ainda assim, não prometeria anonimato absoluto: o texto pode identificar alguém, e a infraestrutura ou os controles antifraude podem processar metadados. O objetivo é reduzir a associação técnica entre relato e autor, comunicar os limites e impedir que o RH tenha acesso a identificadores desnecessários.
 
 ### Fluxo de dados
 
-```mermaid
-flowchart TD
-    subgraph ANON["Zona anônima (sem login, sem IP)"]
-        A["Colaborador"] --> B["API FastAPI"]
-        B --> C["Validação + anti-spam"]
-        C --> D["Gera protocolo + token (guarda só o hash)"]
-    end
-
-    D --> E[("PostgreSQL: conteúdo criptografado")]
-    D -->|"protocolo + token (exibido 1x)"| A
-    E --> F
-
-    subgraph RH["Zona RH (SSO, RBAC, auditoria)"]
-        F["Fila: notificação sem dados do autor"] --> G["Painel do RH"]
-        G --> H["Triagem e investigação"]
-        H --> I["Resposta no protocolo"]
-    end
-
-    I --> E
-    A -.->|"consulta com o token"| E
-```
+Pessoa → formulário sem login → API e controles contra abuso → armazenamento criptografado + protocolo e hash do segredo → painel restrito do RH → resposta acessível com o protocolo e o segredo.
 
 ### Implementação
 
-```python
-import hmac, secrets, hashlib
-from cryptography.fernet import Fernet
-from fastapi import APIRouter, Depends, Header, HTTPException
-
-router = APIRouter()
-fernet = Fernet(settings.CHAVE_CONTEUDO)  # vem de KMS/secret manager
-
-def novo_acesso() -> tuple[str, str, str]:
-    protocolo = secrets.token_hex(4).upper()
-    token = secrets.token_urlsafe(32)
-    return protocolo, token, hashlib.sha256(token.encode()).hexdigest()
-
-@router.post("/denuncias", status_code=201)
-async def criar(body: DenunciaIn, db: AsyncSession = Depends(get_db)):
-    protocolo, token, token_hash = novo_acesso()
-    db.add(Denuncia(
-        protocolo=protocolo,
-        token_hash=token_hash,
-        categoria=body.categoria,
-        conteudo=fernet.encrypt(body.texto.encode()),
-    ))
-    await db.commit()
-    await fila.enqueue_job("notificar_rh", protocolo)  # sem dados do autor
-    return {"protocolo": protocolo, "token": token}    # exibido uma única vez
-
-@router.get("/denuncias/{protocolo}")
-async def consultar(protocolo: str, x_token: str = Header(...), db=Depends(get_db)):
-    d = await db.scalar(select(Denuncia).where(Denuncia.protocolo == protocolo))
-    h = hashlib.sha256(x_token.encode()).hexdigest()
-    if not d or not hmac.compare_digest(d.token_hash, h):
-        raise HTTPException(status_code=404)  # mesma resposta nos dois casos
-    return {"status": d.status, "respostas": d.respostas_publicas}
-```
+Ao receber o relato, criaria o caso e um evento de notificação em uma transação com outbox, para evitar que o caso seja salvo sem que o RH seja avisado. A notificação levaria apenas o protocolo e a prioridade necessária; o conteúdo seria acessado no painel autorizado. O token de acompanhamento teria alta entropia, seria armazenado somente como hash e seria exigido para consultar ou responder ao caso. Anexos, se permitidos, passariam por validação e remoção de metadados como EXIF.
 
 ### Decisões de anonimato e segurança
 
-- **Sem rastros:** `uvicorn --no-access-log`, proxy e WAF com log de IP e user-agent desligado, e remoção de EXIF dos anexos (Pillow).
-- **Rate limit sem identificar:** chave no Redis com hash do IP + sal rotativo e TTL curto. Nada disso vai para o banco.
-- **Painel do RH:** SSO, RBAC e trilha de auditoria registrando quem do RH abriu cada caso.
-- **Triagem assistida:** um classificador (NLP/LLM) sugere categoria e gravidade, e uma pessoa sempre revisa. Casos graves disparam alerta imediato.
-- **Reidentificação pelo texto:** o formulário avisa que detalhes muito específicos podem expor o autor, e o RH recebe orientação para tratar isso com cuidado.
-- **Criptografia:** TLS em trânsito e Fernet em repouso, com a chave fora do banco.
-- **LGPD:** base legal, retenção definida, acesso restrito e política explícita contra retaliação.
+- **Coleta mínima:** sem login, e-mail ou nome obrigatórios; orientar a pessoa a evitar detalhes que a identifiquem se isso não for necessário.
+- **Metadados e abuso:** evitar logs de conteúdo, IP e user-agent onde possível. Se um controle antifraude precisar de IP, limitar o uso e a retenção; até um hash temporário de IP pode ser dado pessoal e deve ser tratado com transparência.
+- **Painel do RH:** SSO, acesso por função e necessidade de conhecimento, auditoria de leitura e alteração e notificações sem conteúdo sensível.
+- **Triagem assistida:** automação pode sugerir categoria ou urgência, mas uma pessoa revisa; casos urgentes têm um fluxo de resposta claramente definido.
+- **Proteção dos dados:** TLS, criptografia em repouso, gestão de chaves fora do banco, retenção e exclusão definidas e análise jurídica/LGPD.
+- **Limites da anonimidade:** explicar que o conteúdo narrativo pode revelar a identidade e estabelecer medidas de proteção contra retaliação e acesso indevido.
