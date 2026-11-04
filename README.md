@@ -29,29 +29,53 @@ Usaria a API oficial do WhatsApp Business Platform. O webhook faria o handshake 
 
 ```mermaid
 flowchart TD
-    A[Cliente no WhatsApp] --> B[API oficial do WhatsApp]
-    B --> C[Webhook: verifica origem e payload]
-    C --> D[(Evento idempotente + outbox na mesma transação)]
-    D --> E[Fila durável]
-    E --> F[Worker ordenado por conversa]
-    F --> G[Histórico mínimo + busca na base]
-    G --> H[LLM + políticas e validações]
-    H --> I{Resposta segura e fundamentada?}
-    I -->|sim| J[Registrar envio e chamar API]
-    I -->|não ou pediu humano| K[Transferir com contexto necessário]
-    J --> L[Status de entrega e métricas]
-    K --> L
+    subgraph WA[Canal WhatsApp]
+        A[Cliente] --> M[API oficial do WhatsApp Business]
+        M -->|mensagem recebida| H[Webhook de entrada]
+        M -->|status de entrega| CB[Webhook de status]
+    end
+    subgraph IN[Validacao e persistencia]
+        V[GET de verificacao e POST com HMAC]
+        S[Validar esquema e tipo de evento]
+        I[(Inbox com restricao unica por wamid)]
+        O[(Evento e outbox na mesma transacao)]
+        H --> V --> S --> I --> O
+    end
+    O --> P[Publicador da outbox] --> Q[Fila duravel]
+    Q --> W[Worker particionado por conversa]
+    W --> ST[Estado e sequencia da conversa]
+    ST --> R[Router de intencao e politicas]
+    R --> RET[Busca hibrida com filtro de permissao]
+    RET --> CTX[Contexto limitado e versionado]
+    CTX --> L[LLM com saida estruturada]
+    L --> G[Validacao de fonte, formato e politica]
+    G -->|fundamentada| OO[Outbox de resposta]
+    G -->|incerta ou sensivel| HUM[Atendimento humano]
+    OO --> SEND[Envio com retry controlado] --> M
+    HUM --> RH[Painel de atendimento] --> OO
+    CB --> DS[Atualizar estado de entrega]
+    Q -.-> DLQ[Fila de falhas e alerta]
+    W -.-> OBS[Metricas e traces sem conteudo]
+    H -.-> OBS
 ```
 
 Em uma implementação com FastAPI, PostgreSQL e uma fila, eu trataria a gravação do evento e a criação da tarefa de processamento como uma unidade lógica. Como banco e fila normalmente não participam da mesma transação distribuída, usaria um padrão de outbox: persisto o evento recebido e a tarefa de outbox na mesma transação do banco; um publicador separado envia a tarefa à fila e marca o evento como publicado. Só retorno sucesso ao webhook depois que o evento está durável. Isso evita a falha do tipo “marquei como processado, mas não consegui enfileirar”.
 
 Eu projetaria o consumo para entrega pelo menos uma vez, não presumiria execução exatamente uma vez. A Meta pode repetir notificações e uma fila pode reentregar tarefas. Um identificador único, como o ID da mensagem do provedor, impede que o mesmo evento crie dois turnos; operações do worker e o registro de saída precisam também ser idempotentes. Por conversa, manteria uma ordem ou um mecanismo de serialização para que duas mensagens próximas não produzam respostas concorrentes ou fora de contexto. Retries teriam backoff, limite, fila de falhas e alerta; após falhas repetidas, a conversa não deve ficar presa indefinidamente.
 
+### Garantias de processamento e ordenação
+
+Uma fila não garante sozinha a ordem de mensagens nem elimina efeitos duplicados. Eu usaria o identificador da conversa como chave de partição sempre que a tecnologia permitir ordenação por chave. Se isso não estiver disponível, gravaria um número de sequência por conversa e só aplicaria uma transição quando a versão esperada ainda for atual. Um bloqueio com prazo pode expirar enquanto um worker antigo continua rodando; nesse caso, uma chave de fencing ou uma verificação de versão no banco impede que o worker atrasado sobrescreva o estado mais novo.
+
 ### Conhecimento, geração e limites da IA
 
 Separaria a base de conhecimento do prompt. Documentos seriam versionados, revisados por alguém responsável pelo conteúdo e indexados com metadados de fonte, atualização e escopo de acesso. Para cada pergunta, recuperaria poucos trechos relevantes, possivelmente com busca lexical e vetorial combinadas e reranking, e verificaria a qualidade dessa recuperação com um conjunto de perguntas de referência. RAG reduz a necessidade de treinar novamente o modelo quando o conteúdo muda, mas não garante que a resposta esteja correta: recuperação ruim ou documento desatualizado ainda podem gerar uma resposta convincente e errada.
 
+Em um produto com vários clientes ou níveis de acesso, aplicaria os filtros de organização e permissão durante a recuperação, antes de enviar qualquer trecho ao modelo. Não confiaria apenas em instruções no prompt para separar dados. Guardaria a versão dos documentos e do índice usada em cada resposta, o que permite explicar resultados e reprocessar o índice. Avaliaria a recuperação separadamente da geração, por exemplo medindo se os documentos relevantes aparecem entre os primeiros resultados, antes de medir se a resposta final está correta.
+
 A instrução do sistema deixaria claro que o modelo deve usar o material recuperado como evidência, admitir quando não sabe e não tratar texto de documentos ou mensagens como instruções para mudar suas regras. Se a resposta não tiver apoio suficiente, o comportamento padrão seria pedir esclarecimento, oferecer um fluxo determinístico ou transferir para uma pessoa. Não usaria um número de “confiança” do próprio modelo como única barreira; calibraria critérios com avaliações humanas e exemplos reais.
+
+Antes de trocar modelo, prompt ou índice, rodaria um conjunto de regressão com perguntas frequentes, ambiguidades, conteúdo desatualizado, tentativas de manipular instruções e casos em que a resposta correta é não responder. Avaliaria precisão da recuperação, afirmações apoiadas por fonte, recusa apropriada, consistência de formato e encaminhamento para humano. Em produção, acompanharia esses resultados por versão, sem guardar texto pessoal em claro como métrica.
 
 Se o bot puder consultar pedidos ou executar ações, eu separaria isso da geração de texto. O modelo poderia propor uma intenção com parâmetros estruturados; o backend validaria identidade, autorização, estado e limites antes de chamar uma ferramenta permitida. Ações irreversíveis ou sensíveis exigiriam confirmação explícita ou atendimento humano. Não daria ao modelo acesso direto ao banco, credenciais, shell ou ferramentas genéricas.
 
@@ -62,6 +86,10 @@ Manteria um estado explícito por conversa, por exemplo: recebida, em processame
 Para envio, registraria a intenção de responder e o identificador retornado pelo provedor, além de consumir notificações de entrega, falha e leitura quando disponíveis. Em falhas ambíguas de rede, não repetiria cegamente o envio se isso puder gerar mensagens duplicadas; verificaria o estado disponível e usaria a idempotência suportada pelo provedor. O sistema deve distinguir “o modelo gerou uma resposta”, “a API aceitou o envio” e “a mensagem foi entregue”.
 
 ### Cuidados em produção
+
+### Sinais operacionais e critérios de alerta
+
+Eu definiria objetivos de serviço para o recebimento do webhook, o tempo de espera na fila, o início do processamento e a confirmação de envio. Acompanharia latência percentil 95 e 99, idade da mensagem mais antiga na fila, taxa de retries, tamanho da fila de falhas, erros do modelo e resultados de entrega do WhatsApp. Isso separa uma falha de ingestão de uma falha do LLM ou do canal e ajuda a decidir quando desativar uma função, reduzir tráfego ou encaminhar conversas para humanos.
 
 1. **Políticas do canal:** respeitar consentimento prévio, janela de atendimento, templates aprovados e limites vigentes da Meta. Essas regras afetam o desenho das mensagens e precisam ser verificadas antes de cada envio fora da janela permitida.
 1. **Confiabilidade:** manter persistência antes do ACK, idempotência, ordenação por conversa, backpressure, timeouts, circuit breaker para dependências e recuperação de tarefas. Uma queda do LLM não deve impedir o recebimento de mensagens; o sistema pode informar indisponibilidade ou encaminhar para humano.
@@ -104,27 +132,34 @@ Migrations são parte da feature, não uma tarefa operacional separada. Para mud
 
 Testaria a migration com volume e distribuição de dados representativos, monitoraria duração e bloqueios, e definiria como retomar um backfill interrompido. Se a reversão não for segura, o plano precisa ser correção progressiva ou migration para frente, não uma promessa genérica de rollback.
 
+### Decisão de rollout baseada em sinais
+
+Eu separaria os limites de segurança dos indicadores de produto. Um aumento de erros, latência ou mensagens não entregues pode interromper o rollout imediatamente; uma mudança de conversão ou resolução exige uma amostra e um tempo de observação adequados. Compararia coortes equivalentes e segmentaria por versão, tipo de usuário e dependência, sem expor dados pessoais no dashboard. Para baixo volume, um percentual pequeno pode não produzir evidência suficiente, então aumentaria o tempo de observação ou escolheria um grupo controlado apropriado em vez de concluir com poucas amostras.
+
 ### Lançamento controlado e recuperação
 
 Antes do deploy, prepararia dashboard, alertas, baseline, responsável de plantão e critérios objetivos para interromper o rollout. Implantaria primeiro em staging; em produção, usaria canary, blue/green ou feature flag quando esses mecanismos reduzirem o raio de impacto. A flag deve permitir desativar a experiência sem esconder uma incompatibilidade no banco ou em integrações.
 
 ```mermaid
 flowchart TD
-    A[Problema, usuarios e criterios de aceite] --> B[Desenho de fluxo e riscos]
-    B --> C[Implementacao + testes]
-    C --> D[Revisao + CI + artefato imutavel]
-    D --> E[Staging + migrations verificadas]
-    E --> F[Canary ou rollout gradual]
-    F --> G{Indicadores dentro dos limites?}
-    G -->|sim| H[Expandir rollout]
-    H --> I[Confirmar resultado e limpar flag]
-    G -->|nao| J[Desativar flag ou conter rollout]
-    J --> K{Rollback e seguro?}
-    K -->|sim| L[Reverter versao]
-    K -->|nao| M[Aplicar correcao para frente]
-    L --> N[Investigar e atualizar testes]
-    M --> N
-    N --> C
+    A[Resultado e criterios de aceite] --> B[Requisitos de qualidade, SLO e ameacas]
+    B --> C[Contratos, dados e desenho compativel]
+    C --> D[Testes unitarios, integracao e contrato]
+    D --> E[CI, seguranca e artefato imutavel]
+    E --> F[Staging, migration e teste operacional]
+    F --> G[Canary, flag ou blue green]
+    G --> H[Comparar indicadores por coorte com baseline]
+    H --> I{Dentro dos limites definidos?}
+    I -->|sim| J[Expandir exposicao gradualmente]
+    J --> K[Validar impacto no usuario e negocio]
+    K --> L[Remover flag apos estabilidade]
+    I -->|nao| M[Parar rollout e conter impacto]
+    M --> N{Reversao de dados segura?}
+    N -->|sim| O[Reverter aplicacao compativel]
+    N -->|nao| P[Corrigir para frente e reconciliar]
+    O --> Q[Investigar e adicionar teste]
+    P --> Q
+    Q --> C
 ```
 
 Aumentaria gradualmente a exposição, por exemplo por coorte ou percentual, e manteria a comparação com uma população de controle quando isso for útil. Definiria limites de erro, latência e impacto de negócio antes de começar; se um limite for ultrapassado, o rollout para automaticamente ou é interrompido por quem está operando. O percentual exato depende do volume: em baixo tráfego, 1% pode não fornecer amostra suficiente, então o tempo de observação e a estratégia de segmentação precisam ser escolhidos com cuidado.
@@ -151,29 +186,43 @@ A pessoa enviaria o relato sem login, sem nome, correio eletrônico ou vínculo 
 
 ```mermaid
 flowchart TD
-    subgraph ANON[Zona de envio sem conta]
-        A[Pessoa] --> B[Formulario sem login]
-        B --> C[API: validar + limitar abuso]
-        C --> D[Gerar protocolo + segredo aleatorio]
+    subgraph PUBLICA[Canal publico sem conta]
+        A[Pessoa] --> F[Formulario sem identificadores]
+        F --> I[Ingress com controle de abuso]
+        I --> S[Validacao e sanitizacao]
+        S --> G[Gerar protocolo e segredo independente]
     end
-    D -->|mostrar segredo uma vez| A
-    C --> E[(Caso criptografado + hash do segredo)]
-    E --> F[Outbox na mesma transacao]
-    F --> G[Aviso generico ao RH]
-    G --> H[Painel RH com SSO e RBAC]
-    H --> I[Triagem e investigacao humana]
-    I --> E
-    A -.->|protocolo + segredo| J[Consulta e resposta anonima]
-    J --> E
+    G -->|mostrar segredo uma vez| A
+    S --> DB[(Relato cifrado, hash do segredo e estado)]
+    KMS[Gerenciador de chaves] --> DB
+    DB --> OB[(Outbox sem o corpo do relato)]
+    OB --> N[Notificacao generica]
+    N --> HR[Painel RH com SSO, MFA e RBAC]
+    HR --> TRI[Triagem humana e atribuicao por caso]
+    TRI --> DB
+    A -.->|protocolo e segredo| AUTH[Validar hash e limitar tentativas]
+    AUTH --> DB
+    DB -->|status e resposta| A
+    HR -.-> AUD[Auditoria sem texto do relato]
+    I -.-> MET[Metricas agregadas sem identidade]
+    DB -.-> BK[Backup cifrado e retencao definida]
 ```
 
 Separaria os componentes por função: a superfície pública não teria acesso ao painel; o serviço que recebe relatos não precisaria consultar diretórios de funcionários; o RH só veria os casos necessários à sua atribuição. O evento para notificar o RH seria gravado na mesma transação lógica do caso, usando outbox para não perder notificações se a fila ou o serviço de mensagem falhar. A mensagem de notificação levaria o mínimo possível, idealmente apenas um aviso para entrar no painel, porque correio eletrônico, chat corporativo e prévias de notificações podem expor conteúdo sensível.
+
+### Modelo de dados e fronteira criptográfica
+
+Separaria os campos necessários para operar o caso, como protocolo, estado e prazo, do conteúdo narrativo e dos anexos. Cifraria o conteúdo antes de persistir, com uma chave de dados por caso ou por conjunto pequeno de casos, protegida por uma chave de envelope em um gerenciador de chaves. Assim, um vazamento isolado do banco não entrega o texto em claro. Acesso de leitura e escrita seria autorizado na camada de serviço, registrado em uma trilha de auditoria e nunca replicado em logs de aplicação. Backups receberiam a mesma proteção e teriam testes de restauração.
 
 ### Protocolo, segredo e conversa de acompanhamento
 
 O protocolo identifica o caso, mas não deve funcionar como credencial. Geraria um segredo de alta entropia com um gerador criptograficamente seguro, mostraria o segredo uma vez e guardaria apenas um hash adequado para segredo aleatório, possivelmente com proteção adicional por chave fora do banco. O endpoint exigiria o protocolo e o segredo; respostas inválidas teriam comportamento uniforme para reduzir enumeração. O segredo não deveria aparecer em URL, logs, analytics ou cabeçalhos de referência. Se a pessoa o perder, explicaria previamente que o acesso pode não ser recuperável sem uma identidade, pois criar um processo de recuperação por correio eletrônico destruiria parte da anonimidade.
 
 A conversa de acompanhamento ficaria no próprio caso: a pessoa consulta o status e envia complemento com o segredo; o RH publica uma resposta sem pedir login. A aplicação registraria estados e prazos, mas separaria dados operacionais do conteúdo do relato. Essa separação facilita aplicar retenção distinta e restringir o acesso à narrativa, que costuma ser mais sensível que o status do caso.
+
+### Ciclo de vida do caso
+
+Definiria transições permitidas, como recebido, em triagem, em investigação, aguardando complemento, respondido e encerrado. Cada mudança teria ator, horário e motivo na auditoria, sem copiar o relato para esse registro. A atribuição de caso verificaria conflitos de interesse antes de conceder acesso. A política de retenção distinguiria conteúdo, anexos, metadados operacionais, token de acompanhamento e trilha de auditoria; excluir uma parte não deve deixar cópias acessíveis em filas, exportações ou backups fora do prazo definido.
 
 ### Controles técnicos, operacionais e de privacidade
 
