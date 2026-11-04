@@ -142,7 +142,7 @@ A pessoa enviaria o relato sem login, sem nome, e-mail ou vínculo obrigatório.
 
 ```mermaid
 flowchart TD
-    subgraph ANON[Zona de envio sem cuenta]
+    subgraph ANON[Zona de envio sem conta]
         A[Pessoa] --> B[Formulario sem login]
         B --> C[API: validar + limitar abuso]
         C --> D[Gerar protocolo + segredo aleatorio]
