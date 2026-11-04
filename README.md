@@ -32,6 +32,22 @@ No processamento, carregaria apenas o histórico necessário, buscaria contexto 
 
 Cliente no WhatsApp → API oficial → webhook que valida e persiste o evento → fila durável → worker por conversa → histórico e busca RAG → LLM com guardrails → resposta ou transferência para humano → envio pela API oficial.
 
+```mermaid
+flowchart TD
+    A[Cliente no WhatsApp] --> B[API oficial do WhatsApp]
+    B --> C[Webhook valida assinatura]
+    C --> D[(Evento idempotente + outbox)]
+    D --> E[Fila durável]
+    E --> F[Worker ordena por conversa]
+    F --> G[Histórico + busca RAG]
+    G --> H[LLM + guardrails]
+    H --> I{Resposta segura e fundamentada?}
+    I -->|sim| J[Enviar pela API oficial]
+    I -->|não ou pediu humano| K[Atendimento humano]
+    J --> B
+    K --> B
+```
+
 ### Webhook (validação, idempotência e fila)
 
 Validaria a assinatura sobre o corpo original da requisição. Para evitar perda de mensagens, gravaria o evento com uma chave única, como o ID da mensagem, e uma tarefa de outbox na mesma transação; um publicador encaminharia a tarefa à fila. Só responderia sucesso depois da persistência durável. Assim, um retry do provedor não duplica o processamento, e uma falha momentânea da fila não faz o evento desaparecer.
@@ -61,6 +77,20 @@ Implementaria testes unitários para regras de negócio, testes de integração 
 ### Caminho até a produção
 
 Requisitos e critérios de aceite → implementação e testes → revisão e CI → staging → deploy gradual → acompanhamento de métricas → expansão do rollout ou rollback.
+
+```mermaid
+flowchart TD
+    A[Requisitos e critérios de aceite] --> B[Implementação e testes]
+    B --> C[Revisão de código e CI]
+    C --> D[Staging + migrations]
+    D --> E[Deploy gradual com flag ou canary]
+    E --> F{Indicadores saudáveis?}
+    F -->|sim| G[Expandir rollout]
+    G --> H[Validar resultado em produção]
+    F -->|não| I[Desativar flag ou rollback]
+    I --> J[Investigar e corrigir]
+    J --> B
+```
 
 ### Feature flag com rollout gradual
 
@@ -95,6 +125,23 @@ O sistema não deve coletar identidade ou vínculo com a empresa para receber o 
 ### Fluxo de dados
 
 Pessoa → formulário sem login → API e controles contra abuso → armazenamento criptografado + protocolo e hash do segredo → painel restrito do RH → resposta acessível com o protocolo e o segredo.
+
+```mermaid
+flowchart TD
+    subgraph ANON[Canal de envio sem login]
+        A[Pessoa] --> B[Formulario + API]
+        B --> C[Validacao + controle de abuso]
+        C --> D[Protocolo + segredo aleatorio]
+    end
+    D -->|mostrados uma vez| A
+    C --> E[(Relato criptografado + hash do segredo)]
+    E --> F[Outbox: aviso sem o relato]
+    F --> G[Painel RH: SSO + permissoes]
+    G --> H[Triagem e investigacao humana]
+    H --> I[Resposta pelo protocolo]
+    I --> E
+    A -.->|protocolo + segredo| E
+```
 
 ### Implementação
 
